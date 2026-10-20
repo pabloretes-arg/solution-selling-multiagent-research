@@ -1,0 +1,182 @@
+from datetime import date, timedelta
+import time
+
+from smolagents import DuckDuckGoSearchTool, Tool, VisitWebpageTool
+
+
+def _parse_date(signal: str):
+    """Reads the 'YYYY-MM-DD' at the start of a signal. Returns None if it can't."""
+    try:
+        return date.fromisoformat(signal.split("|")[0].strip())
+    except ValueError:
+        return None
+
+
+def _format_signal(signal: str) -> str:
+    """Turns 'date | headline | why | url' into a readable markdown line."""
+    parts = [p.strip() for p in signal.split("|")]
+    if len(parts) == 4:
+        day, headline, why, url = parts
+        return f"- **{day}** · **{headline}**: {why} ([source]({url}))"
+    return f"- {signal}"
+
+
+def _headline(signal: str) -> str:
+    """Date and headline of a signal, without the rest."""
+    parts = [p.strip() for p in signal.split("|")]
+    return " · ".join(parts[:2]) if len(parts) >= 2 else signal
+
+
+class DiscoveryBriefTool(Tool):
+    name = "build_discovery_brief"
+    description = (
+        "Formats the final discovery brief for a B2B sales call. "
+        "Always call this tool once you have finished researching, "
+        "then pass its output directly to final_answer."
+    )
+    inputs = {
+        "company": {"type": "string", "description": "Company name."},
+        "snapshot": {
+            "type": "string",
+            "description": "2-4 sentences: what the company does, its market and footprint. Facts only.",
+        },
+        "recent_signals": {
+            "type": "array",
+            "description": (
+                "Recent news. Each item is a string with this exact format: "
+                "'YYYY-MM-DD | Headline | Why it matters for the company\'s business | Source URL'. "
+                "Only news about this company, not general market statistics."
+            ),
+        },
+        "likely_priorities": {
+            "type": "array",
+            "description": (
+                "3 to 5 of the company's own business priorities (growth, new products, markets, "
+                "efficiency, risk), inferred from the signals. Hypotheses, not facts. "
+                "Do not phrase them in terms of what the seller sells."
+            ),
+        },
+        "discovery_questions": {
+            "type": "array",
+            "description": (
+                "5 open-ended questions a seller would ask the buyer in a first call, from broad to "
+                "specific: first about the company's goals and initiatives, then about the area where "
+                "the seller's offering could help. Not investor or press questions. Never pitch."
+            ),
+        },
+        "where_we_fit": {
+            "type": "array",
+            "description": (
+                "1 to 3 hypotheses on where the seller's offering could connect to those priorities, "
+                "each one linked to a specific signal. Empty list if the user didn't say what they sell."
+            ),
+        },
+        "sources": {"type": "array", "description": "Every source URL used, copied exactly as found."},
+    }
+    output_type = "string"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_brief = None  # the app reads the brief from here, so it never gets lost
+
+    def forward(self, company, snapshot, recent_signals, likely_priorities, where_we_fit, discovery_questions, sources):
+        # Structure enforced in code: if the model breaks it, it gets the error and must fix it
+        problems = []
+        if len(discovery_questions) != 5:
+            problems.append(
+                f"discovery_questions must have exactly 5 items (you sent {len(discovery_questions)}): "
+                "2 broad questions about the company's goals, then 3 about the area of the offering."
+            )
+        if not 3 <= len(likely_priorities) <= 5:
+            problems.append(f"likely_priorities must have 3 to 5 items (you sent {len(likely_priorities)}).")
+        if len(where_we_fit) > 3:
+            problems.append(f"where_we_fit must have at most 3 items (you sent {len(where_we_fit)}).")
+        if problems:
+            raise ValueError("Fix this and call build_discovery_brief again: " + " ".join(problems))
+
+        # Date filter enforced in code: only the last 12 months, newest first
+        cutoff = date.today() - timedelta(days=365)
+        dated = [(_parse_date(s), s) for s in recent_signals]
+        kept = sorted((d, s) for d, s in dated if d and d >= cutoff)[::-1]
+        excluded = [s for d, s in dated if not (d and d >= cutoff)]
+
+        signals_md = "\n".join(_format_signal(s) for _, s in kept) or "- No signals found in the last 12 months."
+        if excluded:
+            # Show what was dropped, so the reader can tell if a priority relies on old news
+            dropped = "\n".join(f"- {_headline(s)}" for s in excluded)
+            signals_md += f"\n\n_Excluded (older than 12 months or undated):_\n{dropped}"
+
+        bullets = lambda items: "\n".join(f"- {item}" for item in items)
+        fit_md = (
+            "\n## Where our offering could fit\n"
+            "> Our angle, to test in the call only after the client describes their priorities.\n\n"
+            f"{bullets(where_we_fit)}\n"
+        ) if where_we_fit else ""
+        numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(discovery_questions, start=1))
+
+        brief = f"""# Discovery brief: {company}
+_Generated on {date.today().isoformat()} from public sources. Verify before using with a client._
+
+## Company snapshot
+{snapshot}
+
+## Recent signals (last 12 months)
+{signals_md}
+
+## Likely priorities
+> These are hypotheses inferred from public signals, to be validated in the call.
+
+{bullets(likely_priorities)}
+{fit_md}
+## Discovery questions
+{numbered}
+
+## Sources
+{bullets(sources)}
+"""
+        # "$" makes markdown viewers render text as math formulas. Escape it.
+        brief = brief.replace("$", "\\$")
+        self.last_brief = brief
+        return brief
+
+
+# Sites that block bots or sit behind a paywall: visiting them only wastes a step
+BLOCKED_DOMAINS = ("bloomberg.com", "wsj.com", "ft.com", "reuters.com", "linkedin.com")
+
+
+class SafeVisitWebpageTool(VisitWebpageTool):
+    """Same as VisitWebpageTool, but skips pages it can't read instead of wasting a step on them."""
+
+    def forward(self, url: str) -> str:
+        if ".pdf" in url.lower():
+            return "Skipped: this tool can't read PDF files. Look for a news article or web page instead."
+        if any(domain in url for domain in BLOCKED_DOMAINS):
+            return "Skipped: this site blocks automated access. Use another source."
+        page = super().forward(url)
+        if not page.strip():
+            return "Empty page (probably built with JavaScript). Use news articles or another source instead."
+        return page
+
+
+class ResilientSearchTool(DuckDuckGoSearchTool):
+    """Same as DuckDuckGoSearchTool, but when a search engine throttles us it waits and tries other
+    engines. If all fail, it says so in one line instead of crashing the step."""
+
+    BACKENDS = ("auto", "bing", "brave", "duckduckgo", "yahoo")
+
+    def forward(self, query: str) -> str:
+        for attempt, backend in enumerate(self.BACKENDS):
+            if attempt:
+                time.sleep(2)  # give the engines a moment before trying the next one
+            try:
+                self._enforce_rate_limit()
+                results = self.ddgs.text(query, max_results=self.max_results, backend=backend)
+            except Exception:
+                continue
+            if results:
+                lines = [f"[{r['title']}]({r['href']})\n{r['body']}" for r in results]
+                return "## Search Results\n\n" + "\n\n".join(lines)
+        return (
+            "Search is temporarily unavailable or found nothing for this query. "
+            "Try a shorter query once; if it fails again, work with the sources you already have."
+        )

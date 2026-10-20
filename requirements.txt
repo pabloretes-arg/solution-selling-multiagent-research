@@ -1,0 +1,7 @@
+smolagents
+litellm
+gradio
+ddgs
+markdownify
+requests
+python-dotenv
