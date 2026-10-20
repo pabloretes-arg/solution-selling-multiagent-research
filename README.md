@@ -2,7 +2,7 @@
 
 **A small solution-selling team made of three AI agents.** The Researcher Agent gathers facts and news about a company, the Account Strategy Agent turns them into a discovery brief, and the Sales Manager Agent rejects the brief if it mixes your pitch into the client's priorities or states doubtful facts.
 
-Built with [smolagents](https://github.com/huggingface/smolagents) as the multi-agent project for **Unit 2.1** of the [Hugging Face AI Agents Course](https://huggingface.co/learn/agents-course). It evolves my single-agent [account-research-agent](https://github.com/pabloretes-arg/account-research-agent).
+Built with [smolagents](https://github.com/huggingface/smolagents). It evolves my single-agent [account-research-agent](https://github.com/pabloretes-arg/account-research-agent).
 
 ## Demo
 
@@ -66,7 +66,7 @@ You ──► Account Strategy Agent (manager, CodeAgent)
 - **Live progress.** The interface shows which agent is working and on what (searching, reading a page, writing, reviewing), with elapsed time.
 - **Long-running delegation.** The researcher runs inside the strategist's code block, so that block gets a 10-minute limit instead of the default 30 seconds.
 - **Planning.** The strategist writes a plan before starting and reviews it halfway (`planning_interval`).
-- **Checks before delivery.** `final_answer_checks` run every time the strategist tries to finish. A rejected brief goes back with the reason. After two rejections it is accepted as is, to avoid endless loops.
+- **Checks before delivery.** `final_answer_checks` run every time the strategist tries to finish. A rejected brief goes back with the reason, and each check allows one revision. More loops cost minutes and rarely improve the brief.
 - **Critical rules live in code.** Date filter, brief structure and step budgets are enforced in code, not in the prompt (same as the single-agent version).
 - **Resilient by design.** Model fallback (`LiteLLMRouterModel`) and search fallback across engines.
 - **Model-agnostic.** The model is a line in `.env`.
@@ -89,18 +89,14 @@ Open http://127.0.0.1:7860. The progress bar shows which agent is working. The p
 
 ## Trade-offs
 
-- **Slower and more expensive.** A team makes more model calls than a single agent: expect 2–4 minutes per brief.
+- **Slower and more expensive.** A team makes more model calls than a single agent, and a reasoning model like Nemotron thinks at length before each step: expect several minutes per brief.
+- **Speed measures.** Search stops retrying for a minute when engines throttle, repeated queries are cached, pages are trimmed, and the Sales Manager can open only one source per review.
 - **An LLM reviewing an LLM is not a guarantee.** The Sales Manager Agent catches the most common mistakes, but the brief still needs a human check before a client meeting.
 - **If the reviewer fails** (e.g. the model provider is down), the brief is delivered anyway rather than lost.
 
-## Series
+## Related project
 
-Built while taking the course:
-
-1. [Account Research Agent](https://github.com/pabloretes-arg/account-research-agent): single agent, smolagents
-2. **Solution Selling Multi-Agent Research**: multi-agent, smolagents (this repo)
-3. LlamaIndex project (coming soon)
-4. LangGraph project (coming soon)
+- [Account Research Agent](https://github.com/pabloretes-arg/account-research-agent): the single-agent version this team evolved from.
 
 ## Author
 

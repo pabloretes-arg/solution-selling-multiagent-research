@@ -12,12 +12,47 @@ def _parse_date(signal: str):
         return None
 
 
-def _format_signal(signal: str) -> str:
+# Fixed texts of the brief, in each language the app offers
+BRIEF_TEXT = {
+    "en": {
+        "title": "Discovery brief",
+        "generated": "Generated on {day} from public sources. Verify before using with a client.",
+        "snapshot": "Company snapshot",
+        "signals": "Recent signals (last 12 months)",
+        "no_signals": "No signals found in the last 12 months.",
+        "excluded": "Excluded (older than 12 months or undated):",
+        "priorities": "Likely priorities",
+        "priorities_note": "These are hypotheses inferred from public signals, to be validated in the call.",
+        "fit": "Where our offering could fit",
+        "fit_note": "Our angle, to test in the call only after the client describes their priorities.",
+        "questions": "Discovery questions",
+        "sources": "Sources",
+        "source": "source",
+    },
+    "es": {
+        "title": "Brief de discovery",
+        "generated": "Generado el {day} a partir de fuentes públicas. Verificar antes de usarlo con un cliente.",
+        "snapshot": "Resumen de la empresa",
+        "signals": "Señales recientes (últimos 12 meses)",
+        "no_signals": "No se encontraron señales en los últimos 12 meses.",
+        "excluded": "Excluidas (más de 12 meses o sin fecha):",
+        "priorities": "Prioridades probables",
+        "priorities_note": "Son hipótesis inferidas de señales públicas, para validar en la reunión.",
+        "fit": "Dónde podría encajar nuestra oferta",
+        "fit_note": "Nuestro ángulo: probarlo en la reunión solo después de que el cliente cuente sus prioridades.",
+        "questions": "Preguntas de discovery",
+        "sources": "Fuentes",
+        "source": "fuente",
+    },
+}
+
+
+def _format_signal(signal: str, source_word: str = "source") -> str:
     """Turns 'date | headline | why | url' into a readable markdown line."""
     parts = [p.strip() for p in signal.split("|")]
     if len(parts) == 4:
         day, headline, why, url = parts
-        return f"- **{day}** · **{headline}**: {why} ([source]({url}))"
+        return f"- **{day}** · **{headline}**: {why} ([{source_word}]({url}))"
     return f"- {signal}"
 
 
@@ -78,6 +113,11 @@ class DiscoveryBriefTool(Tool):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.last_brief = None  # the app reads the brief from here, so it never gets lost
+        self.language = "en"  # set by the app: "en" or "es"
+
+    @property
+    def text(self) -> dict:
+        return BRIEF_TEXT.get(self.language, BRIEF_TEXT["en"])
 
     def forward(self, company, snapshot, recent_signals, likely_priorities, where_we_fit, discovery_questions, sources):
         # Structure enforced in code: if the model breaks it, it gets the error and must fix it
@@ -100,38 +140,37 @@ class DiscoveryBriefTool(Tool):
         kept = sorted((d, s) for d, s in dated if d and d >= cutoff)[::-1]
         excluded = [s for d, s in dated if not (d and d >= cutoff)]
 
-        signals_md = "\n".join(_format_signal(s) for _, s in kept) or "- No signals found in the last 12 months."
+        t = self.text
+        signals_md = "\n".join(_format_signal(s, t["source"]) for _, s in kept) or f"- {t['no_signals']}"
         if excluded:
             # Show what was dropped, so the reader can tell if a priority relies on old news
             dropped = "\n".join(f"- {_headline(s)}" for s in excluded)
-            signals_md += f"\n\n_Excluded (older than 12 months or undated):_\n{dropped}"
+            signals_md += f"\n\n_{t['excluded']}_\n{dropped}"
 
         bullets = lambda items: "\n".join(f"- {item}" for item in items)
         fit_md = (
-            "\n## Where our offering could fit\n"
-            "> Our angle, to test in the call only after the client describes their priorities.\n\n"
-            f"{bullets(where_we_fit)}\n"
+            f"\n## {t['fit']}\n> {t['fit_note']}\n\n{bullets(where_we_fit)}\n"
         ) if where_we_fit else ""
         numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(discovery_questions, start=1))
 
-        brief = f"""# Discovery brief: {company}
-_Generated on {date.today().isoformat()} from public sources. Verify before using with a client._
+        brief = f"""# {t['title']}: {company}
+_{t['generated'].format(day=date.today().isoformat())}_
 
-## Company snapshot
+## {t['snapshot']}
 {snapshot}
 
-## Recent signals (last 12 months)
+## {t['signals']}
 {signals_md}
 
-## Likely priorities
-> These are hypotheses inferred from public signals, to be validated in the call.
+## {t['priorities']}
+> {t['priorities_note']}
 
 {bullets(likely_priorities)}
 {fit_md}
-## Discovery questions
+## {t['questions']}
 {numbered}
 
-## Sources
+## {t['sources']}
 {bullets(sources)}
 """
         # "$" makes markdown viewers render text as math formulas. Escape it.
@@ -159,15 +198,32 @@ class SafeVisitWebpageTool(VisitWebpageTool):
 
 
 class ResilientSearchTool(DuckDuckGoSearchTool):
-    """Same as DuckDuckGoSearchTool, but when a search engine throttles us it waits and tries other
-    engines. If all fail, it says so in one line instead of crashing the step."""
+    """Same as DuckDuckGoSearchTool, but faster and sturdier:
+    - if a search engine throttles us, it tries two others;
+    - if all of them fail, it stops retrying for a minute (no point waiting on every query);
+    - repeated queries come from a cache instead of the internet."""
 
-    BACKENDS = ("auto", "bing", "brave", "duckduckgo", "yahoo")
+    BACKENDS = ("auto", "bing", "brave")
+    COOLDOWN_SECONDS = 60
+    UNAVAILABLE = (
+        "Search is temporarily unavailable. Don't search again for now: "
+        "work with the sources you already have, or visit known pages directly."
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cache: dict[str, str] = {}
+        self._down_until = 0.0
 
     def forward(self, query: str) -> str:
+        key = query.strip().lower()
+        if key in self._cache:
+            return self._cache[key]
+        if time.time() < self._down_until:
+            return self.UNAVAILABLE
         for attempt, backend in enumerate(self.BACKENDS):
             if attempt:
-                time.sleep(2)  # give the engines a moment before trying the next one
+                time.sleep(1)
             try:
                 self._enforce_rate_limit()
                 results = self.ddgs.text(query, max_results=self.max_results, backend=backend)
@@ -175,8 +231,7 @@ class ResilientSearchTool(DuckDuckGoSearchTool):
                 continue
             if results:
                 lines = [f"[{r['title']}]({r['href']})\n{r['body']}" for r in results]
-                return "## Search Results\n\n" + "\n\n".join(lines)
-        return (
-            "Search is temporarily unavailable or found nothing for this query. "
-            "Try a shorter query once; if it fails again, work with the sources you already have."
-        )
+                self._cache[key] = "## Search Results\n\n" + "\n\n".join(lines)
+                return self._cache[key]
+        self._down_until = time.time() + self.COOLDOWN_SECONDS
+        return self.UNAVAILABLE

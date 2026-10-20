@@ -7,7 +7,7 @@ from tools import ResilientSearchTool, SafeVisitWebpageTool
 TODAY = date.today()
 CUTOFF = TODAY - timedelta(days=365)
 
-RESEARCHER_STEPS = 8
+RESEARCHER_STEPS = 6
 
 RESEARCHER_INSTRUCTIONS = f"""
 You are a company researcher. Today's date is {TODAY.isoformat()}.
@@ -36,10 +36,12 @@ MARKET CONTEXT: optional, one line each, with source URL
 
 researcher = CodeAgent(
     model=model,
-    tools=[ResilientSearchTool(max_results=5), SafeVisitWebpageTool(max_output_length=8000)],
+    tools=[ResilientSearchTool(max_results=5), SafeVisitWebpageTool(max_output_length=5000)],
     instructions=RESEARCHER_INSTRUCTIONS,
     max_steps=RESEARCHER_STEPS,
     step_callbacks=[budget_reminder(RESEARCHER_STEPS, "Stop searching and pass your report to final_answer now.")],
+    # Several searches in one code block can take more than the default 30 seconds
+    executor_kwargs={"timeout_seconds": 120},
     name="researcher",
     description=(
         "Researches a company on the web. Give it the company name, the market (country) and what to look for. "

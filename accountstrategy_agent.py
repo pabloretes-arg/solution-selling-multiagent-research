@@ -42,12 +42,12 @@ Rules for the brief:
 
 # ---------- FINAL ANSWER CHECKS ----------
 # Run automatically before the final answer is accepted. If one fails, the agent sees why and retries.
-MAX_REVIEWS = 2  # after this, the brief is accepted as is (avoids endless loops)
+MAX_REVIEWS = 1  # one revision per check, then the brief is delivered (each extra loop costs minutes)
 
 
 def brief_was_built(final_answer, memory, agent=None) -> bool:
     """The final answer must be the brief produced by the tool, not a summary of it."""
-    if brief_tool.last_brief is None or "# Discovery brief" not in str(final_answer):
+    if brief_tool.last_brief is None or f"# {brief_tool.text['title']}" not in str(final_answer):
         raise ValueError("Pass the text returned by build_discovery_brief to final_answer, not a summary.")
     return True
 
@@ -69,7 +69,8 @@ def no_offering_words_in_priorities(final_answer, memory, agent=None) -> bool:
     if not offering:
         return True
     keywords = {w for w in re.findall(r"[a-záéíóúñ]+", offering.group(1).lower()) if len(w) >= 6} - GENERIC_WORDS
-    section = str(final_answer).split("## Likely priorities")[-1].split("## Where our offering")[0].split("## Discovery")[0]
+    t = brief_tool.text
+    section = str(final_answer).split(f"## {t['priorities']}")[-1].split(f"## {t['fit']}")[0].split(f"## {t['questions']}")[0]
     for line in section.splitlines():
         hits = [w for w in keywords if w[:7] in line.lower()]
         if line.startswith("- ") and hits:

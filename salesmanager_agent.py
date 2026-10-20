@@ -2,10 +2,10 @@
 It is a ToolCallingAgent (actions as JSON tool calls, not code): it only needs to read
 the brief, open a source when a fact looks doubtful, and give a verdict."""
 from smolagents import ToolCallingAgent
-from model import model
+from model import review_model
 from tools import SafeVisitWebpageTool
 
-SALES_MANAGER_STEPS = 4
+SALES_MANAGER_STEPS = 3
 MAX_SOURCE_CHECKS = 1  # enforced in code: one source per review, then a verdict
 
 
@@ -36,6 +36,7 @@ Check these rules:
    it, including the article's own publication date. Check at most one.
 Be strict: approving a weak brief is worse than sending it back.
 Write the reason in the same language as the brief.
+Think briefly: this is a quick review, not a rewrite.
 
 Give your verdict with final_answer, in exactly one line:
 PASS
@@ -44,7 +45,7 @@ FAIL: <which item breaks which rule, and how to rewrite it>
 """
 
 sales_manager = ToolCallingAgent(
-    model=model,
+    model=review_model,
     tools=[OneSourceCheckTool(max_output_length=6000)],
     instructions=SALES_MANAGER_INSTRUCTIONS,
     max_steps=SALES_MANAGER_STEPS,

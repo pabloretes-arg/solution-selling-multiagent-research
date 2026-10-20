@@ -16,9 +16,9 @@ if not MODEL_ID:
 FALLBACK_MODEL_IDS = [m.strip() for m in os.getenv("FALLBACK_MODEL_IDS", "").split(",") if m.strip()]
 
 
-def build_model():
+def build_model(max_tokens: int = 4096):
     if not FALLBACK_MODEL_IDS:
-        return LiteLLMModel(model_id=MODEL_ID, max_tokens=4096)
+        return LiteLLMModel(model_id=MODEL_ID, max_tokens=max_tokens)
     backups = [f"backup-{i}" for i in range(len(FALLBACK_MODEL_IDS))]
     model_list = [{"model_name": "main", "litellm_params": {"model": MODEL_ID}}] + [
         {"model_name": name, "litellm_params": {"model": model_id}}
@@ -28,11 +28,15 @@ def build_model():
         model_id="main",
         model_list=model_list,
         client_kwargs={"fallbacks": [{"main": backups}], "num_retries": 1},
-        max_tokens=4096,
+        max_tokens=max_tokens,
     )
 
 
 model = build_model()
+
+# Same model for the Sales Manager, with more room to answer: a reasoning model like Nemotron can spend
+# its whole budget thinking and return nothing, which wastes a full step (it happened with 4096 tokens).
+review_model = build_model(max_tokens=8192)
 
 # ---------- STEP BUDGET ----------
 # Enforced in code: near its step limit, an agent is told to stop and deliver what it has.
