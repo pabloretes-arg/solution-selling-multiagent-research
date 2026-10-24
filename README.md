@@ -59,6 +59,8 @@ You ──► Account Strategy Agent (manager, CodeAgent)
 | `model.py` | Shared model setup (with fallback) and the step budget |
 | `tools.py` | Search, page reader and the brief builder |
 | `app.py` | The web interface |
+| `tracing.py` | Optional Langfuse tracing (off if there are no Langfuse keys in `.env`) |
+| `translator.py` | Translates a finished brief into the other language (English ⇄ Spanish) in the background |
 
 ## Design decisions
 
@@ -70,6 +72,9 @@ You ──► Account Strategy Agent (manager, CodeAgent)
 - **Critical rules live in code.** Date filter, brief structure and step budgets are enforced in code, not in the prompt (same as the single-agent version).
 - **Resilient by design.** Model fallback (`LiteLLMRouterModel`) and search fallback across engines.
 - **Model-agnostic.** The model is a line in `.env`.
+- **The right model for each job.** The three agents use a reasoning model (NVIDIA Nemotron), which plans and checks well but thinks at length. Translating doesn't need that, so a fast model (Gemini Flash Lite by default, `TRANSLATION_MODEL_ID` in `.env`) translates each brief into the other language in seconds, with Nemotron as its backup.
+- **Bilingual briefs.** The brief is written in the language selected (English or Spanish) and translated into the other one in the background, so the language switch shows it at once. The translation is checked in code (same items, same structure) before it is shown.
+- **Observability.** Optional tracing with OpenTelemetry and [Langfuse](https://langfuse.com): every step, tool call, token and error of the three agents is recorded as one timeline per run. When it's on, the app links each brief to its trace.
 
 ## Run it locally
 

@@ -65,7 +65,8 @@ def no_offering_words_in_priorities(final_answer, memory, agent=None) -> bool:
     """Checked in code: a 'priority' that uses the words of what we sell is our pitch, not the client's priority."""
     if _times_rejected(memory, "no_offering_words_in_priorities") >= MAX_REVIEWS:
         return True
-    offering = re.search(r"We sell (.+?)\.?$", agent.task if agent else "")
+    # Up to the first ". ": in Spanish runs the task continues after the offering ("Write all the content...")
+    offering = re.search(r"We sell (.+?)\.(?:\s|$)", agent.task if agent else "")
     if not offering:
         return True
     keywords = {w for w in re.findall(r"[a-záéíóúñ]+", offering.group(1).lower()) if len(w) >= 6} - GENERIC_WORDS

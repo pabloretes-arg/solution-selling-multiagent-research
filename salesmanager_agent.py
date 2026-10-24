@@ -1,12 +1,15 @@
 """Sales Manager Agent: reviews the discovery brief before it reaches the seller.
 It is a ToolCallingAgent (actions as JSON tool calls, not code): it only needs to read
 the brief, open a source when a fact looks doubtful, and give a verdict."""
+import contextvars
+import threading
 from smolagents import ToolCallingAgent
 from model import review_model
 from tools import SafeVisitWebpageTool
 
 SALES_MANAGER_STEPS = 3
 MAX_SOURCE_CHECKS = 1  # enforced in code: one source per review, then a verdict
+REVIEW_TIMEOUT = 180  # seconds; enforced in code: a stuck review is skipped and the brief is delivered
 
 
 class OneSourceCheckTool(SafeVisitWebpageTool):
@@ -36,7 +39,7 @@ Check these rules:
    it, including the article's own publication date. Check at most one.
 Be strict: approving a weak brief is worse than sending it back.
 Write the reason in the same language as the brief.
-Think briefly: this is a quick review, not a rewrite.
+Think briefly: this is a quick review, not a rewrite. Keep your reasoning under 150 words, then answer.
 
 Give your verdict with final_answer, in exactly one line:
 PASS
@@ -46,7 +49,7 @@ FAIL: <which item breaks which rule, and how to rewrite it>
 
 sales_manager = ToolCallingAgent(
     model=review_model,
-    tools=[OneSourceCheckTool(max_output_length=6000)],
+    tools=[OneSourceCheckTool(max_output_length=3000)],  # the start of an article is enough to verify a fact
     instructions=SALES_MANAGER_INSTRUCTIONS,
     max_steps=SALES_MANAGER_STEPS,
     name="sales_manager",
@@ -55,11 +58,36 @@ sales_manager = ToolCallingAgent(
 )
 
 
+_last_review = None  # the thread of the last review, to never run two reviews on the same agent at once
+
+
 def review_brief(brief: str, request: str) -> str:
     """Returns the sales manager's verdict: 'PASS' or 'FAIL: ...'."""
+    global _last_review
+    if _last_review is not None and _last_review.is_alive():
+        # A review that timed out may still be finishing its last call; sharing the agent would mix both reviews
+        raise RuntimeError("the previous review is still finishing")
     sales_manager.tools["visit_webpage"].checks_left = MAX_SOURCE_CHECKS  # a fresh allowance for each review
-    verdict = sales_manager.run(f"The seller's request: {request}\n\nBRIEF TO REVIEW:\n{brief}")
-    return str(verdict).strip()
+    result = {}
+
+    def work():
+        try:
+            result["verdict"] = sales_manager.run(f"The seller's request: {request}\n\nBRIEF TO REVIEW:\n{brief}")
+        except Exception as error:
+            result["error"] = error
+
+    # The review runs in its own thread with a deadline, so a slow or stuck model can't freeze the team.
+    # copy_context() carries the current trace into that thread: in Langfuse the review stays inside the run.
+    worker = threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True)
+    _last_review = worker
+    worker.start()
+    worker.join(REVIEW_TIMEOUT)
+    if worker.is_alive():
+        sales_manager.interrupt()  # it stops at the end of its current step instead of going on
+        raise TimeoutError(f"the review took more than {REVIEW_TIMEOUT} seconds")
+    if "error" in result:
+        raise result["error"]
+    return str(result["verdict"]).strip()
 
 
 if __name__ == "__main__":

@@ -5,3 +5,7 @@ ddgs
 markdownify
 requests
 python-dotenv
+langfuse
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+openinference-instrumentation-smolagents

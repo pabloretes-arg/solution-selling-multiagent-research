@@ -113,6 +113,7 @@ class DiscoveryBriefTool(Tool):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.last_brief = None  # the app reads the brief from here, so it never gets lost
+        self.last_args = None  # what the agent sent, to write the brief again in another language
         self.language = "en"  # set by the app: "en" or "es"
 
     @property
@@ -134,13 +135,26 @@ class DiscoveryBriefTool(Tool):
         if problems:
             raise ValueError("Fix this and call build_discovery_brief again: " + " ".join(problems))
 
+        self.last_args = {
+            "company": company, "snapshot": snapshot, "recent_signals": recent_signals,
+            "likely_priorities": likely_priorities, "where_we_fit": where_we_fit,
+            "discovery_questions": discovery_questions, "sources": sources,
+        }
+        self.last_brief = self.render(self.language)
+        return self.last_brief
+
+    def render(self, language: str, args: dict | None = None) -> str:
+        """Writes the brief with its headings in the given language. The app calls it again when the
+        language switch changes, so the headings follow the switch (the content stays as the agents wrote it)."""
+        a = args or self.last_args
+        t = BRIEF_TEXT.get(language, BRIEF_TEXT["en"])
+
         # Date filter enforced in code: only the last 12 months, newest first
         cutoff = date.today() - timedelta(days=365)
-        dated = [(_parse_date(s), s) for s in recent_signals]
+        dated = [(_parse_date(s), s) for s in a["recent_signals"]]
         kept = sorted((d, s) for d, s in dated if d and d >= cutoff)[::-1]
         excluded = [s for d, s in dated if not (d and d >= cutoff)]
 
-        t = self.text
         signals_md = "\n".join(_format_signal(s, t["source"]) for _, s in kept) or f"- {t['no_signals']}"
         if excluded:
             # Show what was dropped, so the reader can tell if a priority relies on old news
@@ -149,15 +163,15 @@ class DiscoveryBriefTool(Tool):
 
         bullets = lambda items: "\n".join(f"- {item}" for item in items)
         fit_md = (
-            f"\n## {t['fit']}\n> {t['fit_note']}\n\n{bullets(where_we_fit)}\n"
-        ) if where_we_fit else ""
-        numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(discovery_questions, start=1))
+            f"\n## {t['fit']}\n> {t['fit_note']}\n\n{bullets(a['where_we_fit'])}\n"
+        ) if a["where_we_fit"] else ""
+        numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(a["discovery_questions"], start=1))
 
-        brief = f"""# {t['title']}: {company}
+        brief = f"""# {t['title']}: {a['company']}
 _{t['generated'].format(day=date.today().isoformat())}_
 
 ## {t['snapshot']}
-{snapshot}
+{a['snapshot']}
 
 ## {t['signals']}
 {signals_md}
@@ -165,18 +179,16 @@ _{t['generated'].format(day=date.today().isoformat())}_
 ## {t['priorities']}
 > {t['priorities_note']}
 
-{bullets(likely_priorities)}
+{bullets(a['likely_priorities'])}
 {fit_md}
 ## {t['questions']}
 {numbered}
 
 ## {t['sources']}
-{bullets(sources)}
+{bullets(a['sources'])}
 """
         # "$" makes markdown viewers render text as math formulas. Escape it.
-        brief = brief.replace("$", "\\$")
-        self.last_brief = brief
-        return brief
+        return brief.replace("$", "\\$")
 
 
 # Sites that block bots or sit behind a paywall: visiting them only wastes a step

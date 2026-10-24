@@ -1,7 +1,6 @@
 import functools
 import html
 import os
-import queue
 import re
 import tempfile
 import threading
@@ -16,6 +15,12 @@ from smolagents.memory import ActionStep, PlanningStep
 from accountstrategy_agent import agent, brief_tool
 from researcher_agent import researcher
 from salesmanager_agent import sales_manager
+from translator import translate_brief
+from model import (FALLBACK_MODEL_IDS, MODEL_ID, TRANSLATION_MODEL_ID, model, review_model,
+                   translation_model)
+import tracing
+
+tracing.setup()  # Langfuse, only if its keys are in .env
 
 # ---------- LANGUAGE: every visible text, in English and Spanish ----------
 UI_TEXT = {
@@ -37,6 +42,7 @@ UI_TEXT = {
         "head": {"progress": "In progress", "ready": "Brief ready", "stopped": "Stopped"},
         "no_activity": "No activity yet",
         "thinking": "Thinking… {s}s",
+        "trace_link": "Open this run in Langfuse ↗",
         "source_limit": "Source limit reached: deciding with what it has",
         "planning": "Planning the research",
         "delegating": "Delegating the research to the Researcher Agent",
@@ -57,6 +63,14 @@ UI_TEXT = {
         "provider_message": "⚠️ The model provider didn't respond (it may be overloaded). Wait a minute and try again.",
         "fallback_tip": " Tip: set FALLBACK_MODEL_IDS in .env so the team switches to a backup model automatically.",
         "no_brief": "⚠️ The team finished without building a brief. Please try again.",
+        "translating": "Translating the content of the brief… (the headings are already in English)",
+        "models": "Models (LLMs)",
+        "llm_roles": {"agents": "Brain of the 3 agents", "backup": "Backup if the main model fails",
+                      "translation": "Translates the brief"},
+        "llm_now": "Now: {who}", "llm_last": "Last: {who} · {s}s", "llm_calls": "{n} calls", "llm_call": "1 call", "llm_translating": "translation",
+        "llm_idle": "Idle", "llm_working": "Working",
+        "translate_failed": "The content couldn't be translated, so it stays in the language it was written in. "
+                            "To get it in English, generate the brief with English selected.",
     },
     "es": {
         "eyebrow": "Solution Selling Intelligence · Multi-Agente",
@@ -76,6 +90,7 @@ UI_TEXT = {
         "head": {"progress": "En curso", "ready": "Brief listo", "stopped": "Detenido"},
         "no_activity": "Sin actividad todavía",
         "thinking": "Pensando… {s}s",
+        "trace_link": "Ver esta corrida en Langfuse ↗",
         "source_limit": "Límite de fuentes alcanzado: decide con lo que tiene",
         "planning": "Planificando la investigación",
         "delegating": "Delegando la investigación al Researcher Agent",
@@ -96,12 +111,20 @@ UI_TEXT = {
         "provider_message": "⚠️ El proveedor del modelo no respondió (puede estar saturado). Esperá un minuto y probá de nuevo.",
         "fallback_tip": " Consejo: configurá FALLBACK_MODEL_IDS en .env para que el equipo pase a un modelo de respaldo.",
         "no_brief": "⚠️ El equipo terminó sin armar el brief. Probá de nuevo.",
+        "translating": "Traduciendo el contenido del brief… (los títulos ya están en español)",
+        "models": "Modelos (LLMs)",
+        "llm_roles": {"agents": "Cerebro de los 3 agentes", "backup": "Respaldo si falla el modelo principal",
+                      "translation": "Traduce el brief"},
+        "llm_now": "Ahora: {who}", "llm_last": "Último: {who} · {s}s", "llm_calls": "{n} llamadas", "llm_call": "1 llamada", "llm_translating": "traducción",
+        "llm_idle": "En espera", "llm_working": "Trabajando",
+        "translate_failed": "No se pudo traducir el contenido, así que queda en el idioma en que se escribió. "
+                            "Para tenerlo en español, generá el brief con Español elegido.",
     },
 }
 
 
 def tr(key: str, lang: str | None = None, **values):
-    """Text in the current language (the one chosen when the run started)."""
+    """Text in the given language (by default, the language the run started with)."""
     text = UI_TEXT[lang or STATUS["lang"]][key]
     return text.format(**values) if values else text
 
@@ -162,7 +185,7 @@ def save_brief(company: str, brief: str) -> str:
 
 # ---------- LIVE PROGRESS: which agent is working, and what each one is doing ----------
 # The agents run in a background thread. Small wrappers around their tools write to STATUS and LOGS,
-# and the interface reads them every half second to draw the stage bar and one card per agent.
+# and the interface reads them every second to draw the stage bar and one card per agent.
 STAGES = [("plan", "Plan"), ("research", "Research"), ("write", "Write brief"), ("review", "Review"), ("done", "Done")]
 AGENTS = [
     ("strategist", "Account Strategy Agent", "Manager · CodeAgent", "Plans, delegates and writes the brief"),
@@ -173,12 +196,19 @@ STATUS = {"stage": "plan", "active": "strategist", "start": time.time(), "lang":
 LOGS = {key: [] for key, *_ in AGENTS}
 
 
-def log(agent_key: str, text: str, stage: str | None = None) -> None:
-    """Records what an agent is doing and marks it as the active one."""
+def log(agent_key: str, key: str, stage: str | None = None, **values) -> None:
+    """Records what an agent is doing and marks it as the active one.
+    It keeps the text key, not the translated text: the page translates it when it draws it,
+    so switching the language also changes what is already on screen."""
     STATUS["active"] = agent_key
     if stage:
         STATUS["stage"] = stage
-    LOGS[agent_key].append((time.time() - STATUS["start"], text))
+    LOGS[agent_key].append((time.time() - STATUS["start"], key, values))
+
+
+def log_text(entry, lang: str) -> str:
+    _, key, values = entry
+    return tr(key, lang, **values) if key else values["text"]  # no key: an agent's thought, shown as written
 
 
 def _wrap_tool(tool, agent_key: str, stage: str, describe) -> None:
@@ -187,7 +217,8 @@ def _wrap_tool(tool, agent_key: str, stage: str, describe) -> None:
     @functools.wraps(original)
     def forward(*args, **kwargs):
         first = next(iter(kwargs.values()), args[0] if args else "")
-        log(agent_key, describe(str(first)), stage)
+        key, values = describe(str(first))
+        log(agent_key, key, stage, **values)
         return original(*args, **kwargs)
 
     tool.forward = forward
@@ -199,20 +230,20 @@ def _wrap_check(check):
     @functools.wraps(check)  # keeps the name: each check counts its own rejections by name
     def wrapped(*args, **kwargs):
         if is_review:
-            log("manager", tr("reviewing"), "review")
+            log("manager", "reviewing", "review")
             STEP_MARK["manager"] = len(LOGS["manager"])
         elif check.__name__ == "no_offering_words_in_priorities":
-            log("strategist", tr("self_check"), "review")
+            log("strategist", "self_check", "review")
         try:
             result = check(*args, **kwargs)
         except Exception as error:
             reason = str(error).split("rejected the brief.")[-1].strip().removeprefix("FAIL:").strip()
             reason = reason.split(". Rewrite")[0][:110]
-            log("manager" if is_review else "strategist", tr("rejected", reason=reason))
-            log("strategist", tr("fixing"), "write")
+            log("manager" if is_review else "strategist", "rejected", reason=reason)
+            log("strategist", "fixing", "write")
             raise
         if is_review:
-            log("manager", tr("approved"))
+            log("manager", "approved")
         return result
 
     return wrapped
@@ -223,24 +254,24 @@ def _wrap_researcher_run() -> None:
 
     @functools.wraps(original)
     def run(*args, **kwargs):
-        log("strategist", tr("delegating"))
-        log("researcher", tr("starting"), "research")
+        log("strategist", "delegating")
+        log("researcher", "starting", "research")
         STEP_MARK["researcher"] = len(LOGS["researcher"])
         result = original(*args, **kwargs)
-        log("researcher", tr("report_sent"))
-        log("strategist", tr("reading_report"), "write")
+        log("researcher", "report_sent")
+        log("strategist", "reading_report", "write")
         return result
 
     researcher.run = run
 
 
-_wrap_tool(researcher.tools["web_search"], "researcher", "research", lambda q: tr("searching", q=q[:60]))
+_wrap_tool(researcher.tools["web_search"], "researcher", "research", lambda q: ("searching", {"q": q[:60]}))
 _wrap_tool(researcher.tools["visit_webpage"], "researcher", "research",
-           lambda url: tr("reading", site=urlparse(url).netloc or url[:50]))
+           lambda url: ("reading", {"site": urlparse(url).netloc or url[:50]}))
 _wrap_tool(sales_manager.tools["visit_webpage"], "manager", "review",
-           lambda url: tr("verifying", site=urlparse(url).netloc or url[:50])
-           if sales_manager.tools["visit_webpage"].checks_left > 0 else tr("source_limit"))
-_wrap_tool(brief_tool, "strategist", "write", lambda _: tr("writing"))
+           lambda url: ("verifying", {"site": urlparse(url).netloc or url[:50]})
+           if sales_manager.tools["visit_webpage"].checks_left > 0 else ("source_limit", {}))
+_wrap_tool(brief_tool, "strategist", "write", lambda _: ("writing", {}))
 agent.final_answer_checks = [_wrap_check(check) for check in agent.final_answer_checks]
 _wrap_researcher_run()
 
@@ -256,7 +287,7 @@ def _first_sentence_of_thought(step: ActionStep) -> str:
     text = text.split("<code>")[0].split("```")[0].strip()
     text = re.sub(r"^[\s*#_]*(Thoughts?|Thought process)[\s*_]*:[\s*_]*", "", text, flags=re.IGNORECASE)
     text = text.replace("**", "").strip()
-    if text.startswith(("{", "[")):  # a raw tool call, not a thought
+    if text.startswith(("{", "[", "<")):  # a raw tool call (JSON or <tool_call> tags), not a thought
         return ""
     first = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0] if text else ""
     return first[:160]
@@ -267,7 +298,7 @@ def _thought_logger(agent_key: str):
         thought = _first_sentence_of_thought(step)
         if thought:
             started = getattr(step.timing, "start_time", None) or time.time()
-            LOGS[agent_key].insert(STEP_MARK[agent_key], (max(started - STATUS["start"], 0), f"💭 {thought}"))
+            LOGS[agent_key].insert(STEP_MARK[agent_key], (max(started - STATUS["start"], 0), None, {"text": f"💭 {thought}"}))
         STEP_MARK[agent_key] = len(LOGS[agent_key])
 
     return on_step
@@ -279,118 +310,261 @@ sales_manager.step_callbacks.register(ActionStep, _thought_logger("manager"))
 
 
 def reset_progress(lang: str) -> None:
-    STATUS.update(stage="plan", active="strategist", start=time.time(), lang=lang)
+    STATUS.update(stage="plan", active="strategist", start=time.time(), end=None, lang=lang)
+    LLM["calls"] = {model_id: 0 for model_id in LLM_IDS}
+    LLM["last"] = {}
     for entries in LOGS.values():
         entries.clear()
-    log("strategist", tr("planning"), "plan")
+    log("strategist", "planning", "plan")
     STEP_MARK.update({key: len(entries) for key, entries in LOGS.items()})
 
 
-def render_status(failed: bool = False) -> str:
-    elapsed = time.time() - STATUS["start"]
+# ---------- MODELS: which LLM is answering right now ----------
+# Each model call goes through a small wrapper that records which model it is for, and which model
+# really answered (the router can switch to the backup). The page shows one box per model.
+PROVIDERS = {"nvidia_nim": "NVIDIA", "gemini": "Google", "openai": "OpenAI", "anthropic": "Anthropic",
+             "groq": "Groq", "ollama": "Ollama (local)", "mistral": "Mistral"}
+LLM_IDS = list(dict.fromkeys([MODEL_ID, *FALLBACK_MODEL_IDS, TRANSLATION_MODEL_ID]))  # unique, in order
+LLM = {"active": {}, "calls": {model_id: 0 for model_id in LLM_IDS}, "last": {}}
+# active: call id -> (model id, purpose, agent) · last: model id -> (purpose, agent, seconds) of its last call
+
+
+def _which_llm(answer, expected: str) -> str:
+    """The model id that really answered, read from the provider's response."""
+    answered = str(getattr(getattr(answer, "raw", None), "model", "") or "")
+    for model_id in LLM_IDS:
+        name = model_id.split("/")[-1]
+        if answered and (name in answered or answered in model_id):
+            return model_id
+    return expected
+
+
+def _watch_llm(llm, expected: str, purpose: str) -> None:
+    original = llm.generate
+
+    @functools.wraps(original)
+    def generate(*args, **kwargs):
+        call, started = object(), time.time()
+        LLM["active"][call] = (expected, purpose, STATUS["active"])
+        try:
+            answer = original(*args, **kwargs)
+            used = _which_llm(answer, expected)
+            LLM["calls"][used] = LLM["calls"].get(used, 0) + 1
+            # A fast call can end between two refreshes of the page: the box keeps its last job and how long it took
+            LLM["last"][used] = (purpose, STATUS["active"], time.time() - started)
+            return answer
+        finally:
+            LLM["active"].pop(call, None)
+
+    llm.generate = generate
+
+
+_watch_llm(model, MODEL_ID, "agents")
+_watch_llm(review_model, MODEL_ID, "manager")
+_watch_llm(translation_model, TRANSLATION_MODEL_ID, "translation")
+
+
+def render_models(lang: str) -> str:
+    agent_names = {key: name for key, name, *_ in AGENTS}
+    boxes = []
+    for model_id in LLM_IDS:
+        provider = PROVIDERS.get(model_id.split("/")[0], model_id.split("/")[0])
+        roles = tr("llm_roles", lang)
+        role = " · ".join(
+            [roles["agents"]] * (model_id == MODEL_ID)
+            + [roles["backup"]] * (model_id in FALLBACK_MODEL_IDS)
+            + [roles["translation"]] * (model_id == TRANSLATION_MODEL_ID)
+        )
+        def who(purpose, agent_key):
+            if purpose == "translation":
+                return tr("llm_translating", lang)
+            return agent_names["manager" if purpose == "manager" else agent_key]
+
+        jobs = [who(p, a) for used, p, a in list(LLM["active"].values()) if used == model_id]
+        working = bool(jobs)
+        if working:
+            now = tr("llm_now", lang, who=", ".join(dict.fromkeys(jobs)))
+        elif model_id in LLM["last"]:
+            purpose, agent_key, seconds = LLM["last"][model_id]
+            now = tr("llm_last", lang, who=who(purpose, agent_key), s=round(seconds))
+        else:
+            now = ""
+        chip = tr("llm_working", lang) if working else tr("llm_idle", lang)
+        n = LLM["calls"].get(model_id, 0)
+        calls = tr("llm_call", lang) if n == 1 else tr("llm_calls", lang, n=n)
+        boxes.append(
+            f'<div class="llm {"working" if working else ""}"><div class="top"><div>'
+            f'<div class="nm">{html.escape(model_id.split("/")[-1])}</div>'
+            f'<div class="kd">{html.escape(provider)} · {html.escape(role)}</div></div>'
+            f'<span class="chip">{chip}</span></div>'
+            f'<div class="meta"><span>{calls}</span>'
+            f'<span class="now">{html.escape(now)}</span></div></div>'
+        )
+    return f'<div class="llms-title">{tr("models", lang)}</div><div class="llms">{"".join(boxes)}</div>'
+
+
+def render_status(lang: str, failed: bool = False) -> str:
+    elapsed = (STATUS.get("end") or time.time()) - STATUS["start"]  # the clock stops when the run ends
     finished = STATUS["stage"] == "done" or failed
     keys = [key for key, _ in STAGES]
     current = keys.index(STATUS["stage"])
     cells = "".join(
         f'<div class="stg {"done" if i < current or STATUS["stage"] == "done" else ("active" if i == current else "")}">'
         f'<span class="n">{i + 1:02d}</span><span class="l">{label}</span></div>'
-        for i, label in enumerate(tr("stages"))
+        for i, label in enumerate(tr("stages", lang))
     )
     cards = []
     for key, name, *_ in AGENTS:
         working = key == STATUS["active"] and not finished
         state = "working" if working else ("idle" if not LOGS[key] else "waiting")
-        chips = tr("chips")
+        chips = tr("chips", lang)
         chip = {"working": chips["working"], "idle": chips["idle"],
                 "waiting": chips["done"] if finished else chips["waiting"]}[state]
         lines = "".join(
-            f'<li><span class="ts">{int(t) // 60}:{int(t) % 60:02d}</span>{html.escape(text)}</li>'
-            for t, text in LOGS[key][-6:]
-        ) or f'<li class="empty">{tr("no_activity")}</li>'
-        idle_for = int(elapsed - max((t for t, _ in LOGS[key]), default=elapsed))
+            f'<li><span class="ts">{int(entry[0]) // 60}:{int(entry[0]) % 60:02d}</span>{html.escape(log_text(entry, lang))}</li>'
+            for entry in LOGS[key][-6:]
+        ) or f'<li class="empty">{tr("no_activity", lang)}</li>'
+        idle_for = int(elapsed - max((entry[0] for entry in LOGS[key]), default=elapsed))
         if working and idle_for >= 4:  # the model is generating its next thought
-            lines += f'<li class="thinking">{tr("thinking", s=idle_for)}</li>'
+            lines += f'<li class="thinking">{tr("thinking", lang, s=idle_for)}</li>'
         cards.append(
             f'<div class="card {state}"><div class="top"><div><div class="nm">{name}</div>'
-            f'<div class="kd">{tr("roles")[key]}</div></div><span class="chip">{chip}</span></div><ul>{lines}</ul></div>'
+            f'<div class="kd">{tr("roles", lang)[key]}</div></div><span class="chip">{chip}</span></div><ul>{lines}</ul></div>'
         )
     minutes, seconds = divmod(int(elapsed), 60)
-    heads = tr("head")
+    heads = tr("head", lang)
     note = heads["ready"] if STATUS["stage"] == "done" else (heads["stopped"] if failed else heads["progress"])
     return (
         f'<div id="prog"><div class="head"><span>{note}</span><span class="t">{minutes}:{seconds:02d}</span></div>'
-        f'<div class="stgs">{cells}</div><div class="cards">{"".join(cards)}</div></div>'
+        f'<div class="stgs">{cells}</div><div class="cards">{"".join(cards)}</div>{render_models(lang)}</div>'
     )
 
 
-def _run_agent(company: str, market: str, offering: str, lang: str):
-    """Yields (brief or None, steps, download update, progress html)."""
+# ---------- THE RUN: the team works in the background, the page asks how it is going every second ----------
+# The run doesn't depend on the browser: if the page stops updating (another tab, the laptop sleeps,
+# a dropped connection), the next tick or a page reload shows where the team is, and the brief when ready.
+# Everything is drawn in the language on screen when it is shown, so the language switch works at any time.
+# The content the agents write (snapshot, priorities, questions...) is in the language of the run;
+# if the user switches language afterwards, it is translated once in the background and kept.
+RUN = {"running": False, "started": False, "steps": [], "company": "", "brief_args": None,
+       "message": None, "trace_url": None, "failed": False,
+       "content_lang": "en", "translations": {}, "translating": set(), "translate_failed": set()}
+
+
+def _translate(lang: str, args: dict, translations: dict, translating: set, failed: set) -> None:
+    # It receives this run's containers: if a new run starts meanwhile, this result can't land in it
+    try:
+        translations[lang] = translate_brief(args, lang)
+    except Exception as error:  # the original content stays on screen, with a note
+        print(f"Translation failed: {error}")
+        failed.add(lang)
+    finally:
+        translating.discard(lang)
+
+
+def brief_content(lang: str) -> tuple[dict, str]:
+    """The brief's content for the language on screen, and a note if it is still being translated."""
+    args = RUN["brief_args"]
+    if lang == RUN["content_lang"]:
+        return args, ""
+    if lang in RUN["translations"]:
+        return RUN["translations"][lang], ""
+    if lang in RUN["translate_failed"]:
+        return args, tr("translate_failed", lang)
+    if lang not in RUN["translating"]:  # first time in this language: translate it in the background
+        RUN["translating"].add(lang)
+        threading.Thread(target=_translate, daemon=True, args=(
+            lang, args, RUN["translations"], RUN["translating"], RUN["translate_failed"])).start()
+    return args, tr("translating", lang)
+
+
+def _team_work(company: str, task: str) -> None:
+    """Runs the whole team in a background thread and leaves the result in RUN."""
+    delivered = False
+    try:
+        with tracing.trace_run("discovery-brief", task) as trace:
+            RUN["trace_url"] = trace.url
+            for event in agent.run(task, stream=True):
+                if isinstance(event, PlanningStep):
+                    plan = event.plan.strip()
+                    if re.search(r"```\s*(None)?\s*```", plan):
+                        # A reasoning model sometimes spends its whole answer thinking and returns no plan text
+                        plan = "_The model returned an empty plan this time. The agent goes on without it._"
+                    RUN["steps"].append(f"**Plan**\n\n{plan}")
+                elif isinstance(event, ActionStep):
+                    RUN["steps"].extend(researcher_steps)
+                    researcher_steps.clear()
+                    RUN["steps"].append(describe_step(event).replace("**Step", "**Account Strategy Agent step", 1))
+            trace.set_output(brief_tool.last_brief)
+            if brief_tool.last_brief:
+                RUN["brief_args"] = dict(brief_tool.last_args)
+                log("strategist", "delivered", "done")
+                # The other language is prepared right away in the background (one extra model call),
+                # so switching the language later shows it at once
+                other = "es" if RUN["content_lang"] == "en" else "en"
+                RUN["translating"].add(other)
+                threading.Thread(target=_translate, daemon=True, args=(
+                    other, RUN["brief_args"], RUN["translations"], RUN["translating"], RUN["translate_failed"])).start()
+            else:
+                RUN.update(message="no_brief", failed=True)
+            # Delivered before Langfuse sends its data (on leaving this block): tracing can never delay the brief
+            delivered = True
+            STATUS["end"] = time.time()
+            RUN["running"] = False
+    except Exception as error:  # usually the model provider is down or rate-limited
+        print(f"Agent run failed: {error}")
+        if not delivered:
+            log(STATUS["active"], "provider_failed")
+            RUN.update(message="provider_message", failed=True)
+    finally:
+        STATUS["end"] = STATUS.get("end") or time.time()
+        RUN["running"] = False
+
+
+def show_run(lang: str):
+    """What the page shows right now, in the language on screen.
+    Called every second while the team works, when the page loads and when the language changes."""
+    hidden = gr.update(visible=False)
+    download_label = tr("download", lang)
+    if not RUN["started"]:
+        return hidden, "", gr.update(visible=False, label=download_label), hidden, gr.Timer(active=False)
+    running = RUN["running"]
+    report, download = hidden, gr.update(visible=False, label=download_label)
+    if RUN["brief_args"]:
+        args, note = brief_content(lang)
+        brief = brief_tool.render(lang, args)
+        report = gr.update(value=f"> _{note}_\n\n{brief}" if note else brief, visible=True)
+        download = gr.update(value=save_brief(RUN["company"], brief), visible=True, label=download_label)
+    elif RUN["message"]:
+        message = tr(RUN["message"], lang)
+        if RUN["message"] == "provider_message" and not os.getenv("FALLBACK_MODEL_IDS"):
+            message += tr("fallback_tip", lang)
+        report = gr.update(value=message, visible=True)
+    steps = list(RUN["steps"])
+    if RUN["trace_url"] and not running:
+        steps.insert(0, f"[{tr('trace_link', lang)}]({RUN['trace_url']})")
+    progress = gr.update(value=render_status(lang, failed=RUN["failed"]), visible=True)
+    busy = running or bool(RUN["translating"])  # keep asking every second until the brief is final
+    return report, "\n\n".join(steps), download, progress, gr.Timer(active=busy)
+
+
+def start_run(company: str, market: str, offering: str, lang: str):
+    """Starts the team in the background and returns at once; the timer takes care of the updates."""
+    if RUN["running"]:  # a second click while the team works: just keep showing the current run
+        return show_run(lang)
     if not company.strip():
         raise gr.Error(tr("need_company", lang))
 
     brief_tool.last_brief = None
+    brief_tool.language = lang  # the agents write the brief in the language chosen when the run starts
     researcher_steps.clear()
     reset_progress(lang)
-    brief_tool.language = lang
-    steps = []
-    hidden = gr.update(visible=False)
-    events = queue.Queue()
+    RUN.update(running=True, started=True, steps=[], company=company, brief_args=None, message=None,
+               trace_url=None, failed=False, content_lang=lang, translations={}, translating=set(),
+               translate_failed=set())
     task = build_task(company, market, offering, lang)
-
-    def work():
-        try:
-            for event in agent.run(task, stream=True):
-                events.put(("event", event))
-            events.put(("done", None))
-        except Exception as error:  # usually the model provider is down or rate-limited
-            events.put(("error", error))
-
-    threading.Thread(target=work, daemon=True).start()
-
-    while True:
-        try:
-            kind, payload = events.get(timeout=0.5)
-        except queue.Empty:
-            kind, payload = None, None
-
-        if kind == "event" and isinstance(payload, PlanningStep):
-            steps.append(f"**Plan**\n\n{payload.plan.strip()}")
-        elif kind == "event" and isinstance(payload, ActionStep):
-            steps.extend(researcher_steps)
-            researcher_steps.clear()
-            steps.append(describe_step(payload).replace("**Step", "**Account Strategy Agent step", 1))
-        elif kind == "error":
-            print(f"Agent run failed: {payload}")
-            log(STATUS["active"], tr("provider_failed"))
-            message = tr("provider_message")
-            if not os.getenv("FALLBACK_MODEL_IDS"):
-                message += tr("fallback_tip")
-            yield message, "\n\n".join(steps), hidden, render_status(failed=True)
-            return
-        elif kind == "done":
-            break
-
-        yield None, "\n\n".join(steps), hidden, render_status()
-
-    brief = brief_tool.last_brief
-    if not brief:
-        message = tr("no_brief")
-        yield message, "\n\n".join(steps), hidden, render_status(failed=True)
-        return
-
-    log("strategist", tr("delivered"), "done")
-    download = gr.update(value=save_brief(company, brief), visible=True)
-    yield brief, "\n\n".join(steps), download, render_status()
-
-
-def run_agent(company: str, market: str, offering: str, lang: str):
-    """Shows the progress while the team works, and the report box once there is something to show.
-    The language switch is locked during the run: the run keeps the language it started with."""
-    locked = gr.update(interactive=False)
-    for brief, steps, download, progress in _run_agent(company, market, offering, lang):
-        report = gr.update() if brief is None else gr.update(value=brief, visible=True)
-        yield report, steps, download, gr.update(value=progress, visible=True), locked
-    yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(interactive=True)
+    threading.Thread(target=_team_work, args=(company, task), daemon=True).start()
+    return show_run(lang)
 
 
 def header_html(lang: str) -> str:
@@ -401,15 +575,15 @@ def header_html(lang: str) -> str:
 
 
 def switch_language(lang: str):
-    """Updates every visible text when the language switch changes."""
+    """Updates every visible text when the language switch changes, including the progress and the brief."""
     return (
         header_html(lang),
         gr.update(label=tr("company", lang), info=tr("company_info", lang)),
         gr.update(label=tr("market", lang), info=tr("market_info", lang)),
         gr.update(label=tr("offering", lang), info=tr("offering_info", lang)),
         gr.update(value=tr("button", lang)),
-        gr.update(label=tr("download", lang)),
         gr.update(label=tr("steps", lang)),
+        *show_run(lang),
     )
 
 
@@ -499,6 +673,18 @@ footer {{display: none !important;}}
 #prog .card.working li:last-child:not(.thinking) {{font-weight: 600; color: {INK};}}
 @keyframes pulse {{0%, 100% {{opacity: .55;}} 50% {{opacity: 1;}}}}
 
+/* Models (LLMs): one small box per model, the one answering is highlighted */
+#prog .llms-title {{margin-top: 18px; font-size: 10.5px; letter-spacing: .16em; text-transform: uppercase;
+          color: {MUTED}; font-weight: 600;}}
+#prog .llms {{display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px;}}
+#prog .llm {{flex: 1 1 200px; border: 1px solid {RULE}; padding: 10px 12px; background: {PAPER}; opacity: .7;
+          transition: all .3s;}}
+#prog .llm.working {{opacity: 1; background: #fff; border-color: {INK}; box-shadow: 0 0 0 1px {INK};}}
+#prog .llm .nm {{font-size: 13px;}}
+#prog .llm.working .chip {{border-color: {INK}; color: #fff; background: {INK}; animation: pulse 1.4s infinite;}}
+#prog .llm .meta {{display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 11px; color: {MUTED};}}
+#prog .llm .now {{color: {INK}; font-weight: 600; text-align: right;}}
+
 /* Steps panel and footer */
 #steps {{border: 1px solid {RULE} !important; border-radius: 0 !important; background: #fff !important;}}
 #author, #author * {{text-align: center; color: {MUTED} !important; font-size: 12px !important; letter-spacing: .08em;}}
@@ -521,7 +707,7 @@ with gr.Blocks(title="Solution Selling Multi-Agent Research") as demo:
         gr.HTML("")
         lang = gr.Radio(
             choices=[("English", "en"), ("Español", "es")], value=START_LANG,
-            show_label=False, elem_id="lang", scale=0, min_width=220,
+            label="Language", show_label=False, elem_id="lang", scale=0, min_width=220,
         )
     header = gr.HTML(header_html(START_LANG))
 
@@ -555,12 +741,15 @@ with gr.Blocks(title="Solution Selling Multi-Agent Research") as demo:
 
     gr.Markdown("Pablo Retes · Buenos Aires", elem_id="author")
 
+    timer = gr.Timer(1.0, active=False)
+    run_outputs = [brief_md, steps_md, download, progress, timer]
     for trigger in (run_btn.click, company.submit, market.submit, offering.submit):
-        trigger(run_agent, inputs=[company, market, offering, lang],
-                outputs=[brief_md, steps_md, download, progress, lang])
+        trigger(start_run, inputs=[company, market, offering, lang], outputs=run_outputs, show_progress="hidden")
+    timer.tick(show_run, inputs=lang, outputs=run_outputs, show_progress="hidden")
+    demo.load(show_run, inputs=lang, outputs=run_outputs, show_progress="hidden")  # after a reload, pick up the run
 
     lang.change(switch_language, inputs=lang,
-                outputs=[header, company, market, offering, run_btn, download, steps_box])
+                outputs=[header, company, market, offering, run_btn, steps_box, *run_outputs], show_progress="hidden")
 
 if __name__ == "__main__":
     demo.launch(share=False, theme=THEME, css=CSS)
